@@ -26,6 +26,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -88,10 +89,56 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 			Expect(schedulingpolicy.Status.ObservedGeneration).To(Equal(schedulingpolicy.Generation))
 		})
 
-		It("should hand off matching workloads to the remaining policy after winner policy deletion", func() {
+		It("should not change existing workloads when reconciling a SchedulingPolicy", func() {
 			controllerReconciler := &SchedulingPolicyReconciler{
 				Client: k8sClient,
 				Scheme: k8sClient.Scheme(),
+			}
+
+			deploymentName := types.NamespacedName{Namespace: "default", Name: "existing-policy-target"}
+			deployment := &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      deploymentName.Name,
+					Namespace: deploymentName.Namespace,
+					Labels:    map[string]string{"app": "test-resource"},
+				},
+				Spec: appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "worker"}},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "main", Image: "busybox"}},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, deployment)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, deployment)
+			})
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
+
+			currentDeployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, deploymentName, currentDeployment)).To(Succeed())
+			Expect(currentDeployment.Spec.Template.Spec.SchedulerName).NotTo(Equal("kai-scheduler"))
+			Expect(currentDeployment.Annotations).NotTo(HaveKey(managedByPolicyAnnotation))
+			Expect(currentDeployment.Spec.Template.Annotations).NotTo(HaveKey(managedByPolicyAnnotation))
+		})
+
+		It("should not hand off matching workloads after winner policy deletion", func() {
+			controllerReconciler := &SchedulingPolicyReconciler{
+				Client: k8sClient,
+				Scheme: k8sClient.Scheme(),
+			}
+			deploymentReconciler := &workloadReconciler{
+				Client: controllerReconciler.Client,
+				target: "apps/v1/Deployment",
+				newObj: func() client.Object {
+					return &appsv1.Deployment{}
+				},
+				patch: controllerReconciler.patchDeploymentObject,
 			}
 
 			deploymentName := types.NamespacedName{Namespace: "default", Name: "test-deployment"}
@@ -161,7 +208,7 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 				_ = k8sClient.Delete(ctx, winnerPolicy)
 			})
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: winnerPolicyName})
+			_, err := deploymentReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: deploymentName})
 			Expect(err).NotTo(HaveOccurred())
 
 			currentDeployment := &appsv1.Deployment{}
@@ -175,21 +222,16 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 
 			Expect(k8sClient.Delete(ctx, winnerPolicy)).To(Succeed())
 
-			requests := controllerReconciler.enqueueAllPolicies(ctx, deployment)
-			Expect(requests).To(HaveLen(2))
-
-			for _, request := range requests {
-				_, err = controllerReconciler.Reconcile(ctx, request)
-				Expect(err).NotTo(HaveOccurred())
-			}
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: winnerPolicyName})
+			Expect(err).NotTo(HaveOccurred())
 
 			Expect(k8sClient.Get(ctx, deploymentName, currentDeployment)).To(Succeed())
-			Expect(currentDeployment.Spec.Template.Spec.SchedulerName).To(Equal("backup-scheduler"))
-			Expect(currentDeployment.Spec.Template.Spec.PriorityClassName).To(Equal("backup-priority"))
-			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("queue", "batch-z"))
-			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("team", "ml-platform"))
-			Expect(currentDeployment.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, backupPolicyName.Name))
-			Expect(currentDeployment.Spec.Template.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, backupPolicyName.Name))
+			Expect(currentDeployment.Spec.Template.Spec.SchedulerName).To(Equal("winner-scheduler"))
+			Expect(currentDeployment.Spec.Template.Spec.PriorityClassName).To(Equal("winner-priority"))
+			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("queue", "batch-a"))
+			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("team", "research"))
+			Expect(currentDeployment.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, winnerPolicyName.Name))
+			Expect(currentDeployment.Spec.Template.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, winnerPolicyName.Name))
 		})
 
 		It("should select the highest priority matching policy", func() {
