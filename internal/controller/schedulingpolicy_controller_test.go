@@ -170,6 +170,8 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 			Expect(currentDeployment.Spec.Template.Spec.PriorityClassName).To(Equal("winner-priority"))
 			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("queue", "batch-a"))
 			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("team", "research"))
+			Expect(currentDeployment.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, winnerPolicyName.Name))
+			Expect(currentDeployment.Spec.Template.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, winnerPolicyName.Name))
 
 			Expect(k8sClient.Delete(ctx, winnerPolicy)).To(Succeed())
 
@@ -186,6 +188,8 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 			Expect(currentDeployment.Spec.Template.Spec.PriorityClassName).To(Equal("backup-priority"))
 			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("queue", "batch-z"))
 			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("team", "ml-platform"))
+			Expect(currentDeployment.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, backupPolicyName.Name))
+			Expect(currentDeployment.Spec.Template.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, backupPolicyName.Name))
 		})
 
 		It("should select the highest priority matching policy", func() {

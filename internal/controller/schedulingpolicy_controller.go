@@ -44,6 +44,8 @@ import (
 const (
 	conditionTypeReady = "Ready"
 	requeueInterval    = 5 * time.Minute
+
+	managedByPolicyAnnotation = "ai-paas.org/scheduling-policy"
 )
 
 // SchedulingPolicyReconciler reconciles a SchedulingPolicy object
@@ -538,7 +540,7 @@ func (r *SchedulingPolicyReconciler) listInferenceServices(ctx context.Context, 
 
 func (r *SchedulingPolicyReconciler) patchPodScheduling(ctx context.Context, obj *corev1.Pod, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
 	base := obj.DeepCopy()
-	if !applyTargetToPod(obj, policy.Spec.Target) {
+	if !applyTargetToPod(obj, policy) {
 		return false, nil
 	}
 	return true, r.Patch(ctx, obj, client.MergeFrom(base))
@@ -549,7 +551,7 @@ func (r *SchedulingPolicyReconciler) patchReplicationControllerScheduling(ctx co
 		return false, nil
 	}
 	base := obj.DeepCopy()
-	if !applyTargetToPodTemplate(obj.Spec.Template, policy.Spec.Target) {
+	if !applyTargetToWorkloadTemplate(obj, obj.Spec.Template, policy) {
 		return false, nil
 	}
 	return true, r.Patch(ctx, obj, client.MergeFrom(base))
@@ -557,7 +559,7 @@ func (r *SchedulingPolicyReconciler) patchReplicationControllerScheduling(ctx co
 
 func (r *SchedulingPolicyReconciler) patchDeploymentScheduling(ctx context.Context, obj *appsv1.Deployment, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
 	base := obj.DeepCopy()
-	if !applyTargetToPodTemplate(&obj.Spec.Template, policy.Spec.Target) {
+	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.Template, policy) {
 		return false, nil
 	}
 	return true, r.Patch(ctx, obj, client.MergeFrom(base))
@@ -565,7 +567,7 @@ func (r *SchedulingPolicyReconciler) patchDeploymentScheduling(ctx context.Conte
 
 func (r *SchedulingPolicyReconciler) patchReplicaSetScheduling(ctx context.Context, obj *appsv1.ReplicaSet, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
 	base := obj.DeepCopy()
-	if !applyTargetToPodTemplate(&obj.Spec.Template, policy.Spec.Target) {
+	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.Template, policy) {
 		return false, nil
 	}
 	return true, r.Patch(ctx, obj, client.MergeFrom(base))
@@ -573,7 +575,7 @@ func (r *SchedulingPolicyReconciler) patchReplicaSetScheduling(ctx context.Conte
 
 func (r *SchedulingPolicyReconciler) patchStatefulSetScheduling(ctx context.Context, obj *appsv1.StatefulSet, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
 	base := obj.DeepCopy()
-	if !applyTargetToPodTemplate(&obj.Spec.Template, policy.Spec.Target) {
+	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.Template, policy) {
 		return false, nil
 	}
 	return true, r.Patch(ctx, obj, client.MergeFrom(base))
@@ -581,7 +583,7 @@ func (r *SchedulingPolicyReconciler) patchStatefulSetScheduling(ctx context.Cont
 
 func (r *SchedulingPolicyReconciler) patchDaemonSetScheduling(ctx context.Context, obj *appsv1.DaemonSet, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
 	base := obj.DeepCopy()
-	if !applyTargetToPodTemplate(&obj.Spec.Template, policy.Spec.Target) {
+	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.Template, policy) {
 		return false, nil
 	}
 	return true, r.Patch(ctx, obj, client.MergeFrom(base))
@@ -589,7 +591,7 @@ func (r *SchedulingPolicyReconciler) patchDaemonSetScheduling(ctx context.Contex
 
 func (r *SchedulingPolicyReconciler) patchJobScheduling(ctx context.Context, obj *batchv1.Job, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
 	base := obj.DeepCopy()
-	if !applyTargetToPodTemplate(&obj.Spec.Template, policy.Spec.Target) {
+	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.Template, policy) {
 		return false, nil
 	}
 	return true, r.Patch(ctx, obj, client.MergeFrom(base))
@@ -597,7 +599,7 @@ func (r *SchedulingPolicyReconciler) patchJobScheduling(ctx context.Context, obj
 
 func (r *SchedulingPolicyReconciler) patchCronJobScheduling(ctx context.Context, obj *batchv1.CronJob, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
 	base := obj.DeepCopy()
-	if !applyTargetToPodTemplate(&obj.Spec.JobTemplate.Spec.Template, policy.Spec.Target) {
+	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.JobTemplate.Spec.Template, policy) {
 		return false, nil
 	}
 	return true, r.Patch(ctx, obj, client.MergeFrom(base))
@@ -605,9 +607,9 @@ func (r *SchedulingPolicyReconciler) patchCronJobScheduling(ctx context.Context,
 
 func (r *SchedulingPolicyReconciler) patchInferenceServiceScheduling(ctx context.Context, obj *unstructured.Unstructured, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
 	base := obj.DeepCopy()
-	changed := false
+	changed := applyManagingPolicyAnnotationToObject(obj, policy.Name)
 	for _, component := range []string{"predictor", "transformer", "explainer"} {
-		componentChanged, err := applyTargetToInferenceServiceComponent(obj, component, policy.Spec.Target)
+		componentChanged, err := applyTargetToInferenceServiceComponent(obj, component, policy)
 		if err != nil {
 			return false, err
 		}
@@ -689,14 +691,21 @@ func selectorFromSource(source schedulerv1alpha1.WorkloadSource) (labels.Selecto
 	return metav1.LabelSelectorAsSelector(source.Selector)
 }
 
-func applyTargetToPod(obj *corev1.Pod, target schedulerv1alpha1.SchedulingTarget) bool {
-	changed := applyTargetToPodSpec(&obj.Spec, target)
-	return applyTargetToLabels(&obj.Labels, target) || changed
+func applyTargetToPod(obj *corev1.Pod, policy *schedulerv1alpha1.SchedulingPolicy) bool {
+	changed := applyTargetToPodSpec(&obj.Spec, policy.Spec.Target)
+	changed = applyTargetToLabels(&obj.Labels, policy.Spec.Target) || changed
+	return applyManagingPolicyAnnotationToObject(obj, policy.Name) || changed
 }
 
-func applyTargetToPodTemplate(template *corev1.PodTemplateSpec, target schedulerv1alpha1.SchedulingTarget) bool {
-	changed := applyTargetToPodSpec(&template.Spec, target)
-	return applyTargetToLabels(&template.Labels, target) || changed
+func applyTargetToWorkloadTemplate(workload client.Object, template *corev1.PodTemplateSpec, policy *schedulerv1alpha1.SchedulingPolicy) bool {
+	changed := applyTargetToPodTemplate(template, policy)
+	return applyManagingPolicyAnnotationToObject(workload, policy.Name) || changed
+}
+
+func applyTargetToPodTemplate(template *corev1.PodTemplateSpec, policy *schedulerv1alpha1.SchedulingPolicy) bool {
+	changed := applyTargetToPodSpec(&template.Spec, policy.Spec.Target)
+	changed = applyTargetToLabels(&template.Labels, policy.Spec.Target) || changed
+	return applyManagingPolicyAnnotationToMeta(&template.ObjectMeta, policy.Name) || changed
 }
 
 func applyTargetToPodSpec(spec *corev1.PodSpec, target schedulerv1alpha1.SchedulingTarget) bool {
@@ -735,7 +744,33 @@ func applyTargetToLabels(labelSet *map[string]string, target schedulerv1alpha1.S
 	return true
 }
 
-func applyTargetToInferenceServiceComponent(obj *unstructured.Unstructured, component string, target schedulerv1alpha1.SchedulingTarget) (bool, error) {
+func applyManagingPolicyAnnotationToObject(obj client.Object, policyName string) bool {
+	annotations := obj.GetAnnotations()
+	changed, annotations := applyManagingPolicyAnnotation(annotations, policyName)
+	if changed {
+		obj.SetAnnotations(annotations)
+	}
+	return changed
+}
+
+func applyManagingPolicyAnnotationToMeta(meta *metav1.ObjectMeta, policyName string) bool {
+	changed, annotations := applyManagingPolicyAnnotation(meta.Annotations, policyName)
+	meta.Annotations = annotations
+	return changed
+}
+
+func applyManagingPolicyAnnotation(annotations map[string]string, policyName string) (bool, map[string]string) {
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	if annotations[managedByPolicyAnnotation] == policyName {
+		return false, annotations
+	}
+	annotations[managedByPolicyAnnotation] = policyName
+	return true, annotations
+}
+
+func applyTargetToInferenceServiceComponent(obj *unstructured.Unstructured, component string, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
 	componentMap, found, err := unstructured.NestedMap(obj.Object, "spec", component)
 	if err != nil {
 		return false, err
@@ -748,20 +783,20 @@ func applyTargetToInferenceServiceComponent(obj *unstructured.Unstructured, comp
 	}
 
 	changed := false
-	if shouldSetValue(asString(componentMap["schedulerName"]), target.SchedulerName) {
-		componentMap["schedulerName"] = target.SchedulerName
+	if shouldSetValue(asString(componentMap["schedulerName"]), policy.Spec.Target.SchedulerName) {
+		componentMap["schedulerName"] = policy.Spec.Target.SchedulerName
 		changed = true
 	}
-	if shouldSetValue(asString(componentMap["priorityClassName"]), target.PriorityClassName) {
-		componentMap["priorityClassName"] = target.PriorityClassName
+	if shouldSetValue(asString(componentMap["priorityClassName"]), policy.Spec.Target.PriorityClassName) {
+		componentMap["priorityClassName"] = policy.Spec.Target.PriorityClassName
 		changed = true
 	}
-	if len(target.Labels) > 0 {
+	if len(policy.Spec.Target.Labels) > 0 {
 		labelMap, _ := componentMap["labels"].(map[string]interface{})
 		if labelMap == nil {
 			labelMap = map[string]interface{}{}
 		}
-		for key, value := range target.Labels {
+		for key, value := range policy.Spec.Target.Labels {
 			if !shouldSetValue(asString(labelMap[key]), value) {
 				continue
 			}
@@ -769,6 +804,15 @@ func applyTargetToInferenceServiceComponent(obj *unstructured.Unstructured, comp
 			changed = true
 		}
 		componentMap["labels"] = labelMap
+	}
+	annotationsMap, _ := componentMap["annotations"].(map[string]interface{})
+	if annotationsMap == nil {
+		annotationsMap = map[string]interface{}{}
+	}
+	if shouldSetValue(asString(annotationsMap[managedByPolicyAnnotation]), policy.Name) {
+		annotationsMap[managedByPolicyAnnotation] = policy.Name
+		componentMap["annotations"] = annotationsMap
+		changed = true
 	}
 	if !changed {
 		return false, nil
