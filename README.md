@@ -80,7 +80,7 @@ The commands below use only a locally built image from a cloned repository.
 
 Prerequisites:
 
-- Go 1.24.1 or later
+- Go 1.25 or later
 - Docker or a compatible container runtime
 - kubectl
 - A Kubernetes cluster reachable from the current kubeconfig
