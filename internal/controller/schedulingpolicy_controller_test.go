@@ -25,8 +25,8 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -77,8 +77,8 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 		It("should successfully reconcile the resource", func() {
 			By("Reconciling the created resource")
 			controllerReconciler := &SchedulingPolicyReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
+				Client:   k8sClient,
+				policies: newSchedulingPolicyCache(),
 			}
 
 			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
@@ -89,10 +89,116 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 			Expect(schedulingpolicy.Status.ObservedGeneration).To(Equal(schedulingpolicy.Generation))
 		})
 
+		It("should mark pod sources as unsupported", func() {
+			podPolicyName := types.NamespacedName{Name: "pod-source-policy"}
+			podPolicy := &schedulerv1alpha1.SchedulingPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: podPolicyName.Name},
+				Spec: schedulerv1alpha1.SchedulingPolicySpec{
+					Sources: []schedulerv1alpha1.WorkloadSource{{
+						APIVersion: "v1",
+						Kind:       "Pod",
+						Selector:   &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test-resource"}},
+					}},
+					Target: schedulerv1alpha1.SchedulingTarget{SchedulerName: "kai-scheduler"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, podPolicy)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, podPolicy)
+			})
+
+			controllerReconciler := &SchedulingPolicyReconciler{
+				Client:   k8sClient,
+				policies: newSchedulingPolicyCache(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: podPolicyName})
+			Expect(err).NotTo(HaveOccurred())
+
+			currentPolicy := &schedulerv1alpha1.SchedulingPolicy{}
+			Expect(k8sClient.Get(ctx, podPolicyName, currentPolicy)).To(Succeed())
+			readyCondition := apiMeta.FindStatusCondition(currentPolicy.Status.Conditions, conditionTypeReady)
+			Expect(readyCondition).NotTo(BeNil())
+			Expect(readyCondition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCondition.Reason).To(Equal("UnsupportedSource"))
+			Expect(readyCondition.Message).To(ContainSubstring("v1/Pod"))
+
+			Expect(controllerReconciler.policies.policies).To(BeEmpty())
+		})
+
+		It("should mark job sources as unsupported", func() {
+			jobPolicyName := types.NamespacedName{Name: "job-source-policy"}
+			jobPolicy := &schedulerv1alpha1.SchedulingPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: jobPolicyName.Name},
+				Spec: schedulerv1alpha1.SchedulingPolicySpec{
+					Sources: []schedulerv1alpha1.WorkloadSource{{
+						APIVersion: "batch/v1",
+						Kind:       "Job",
+						Selector:   &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test-resource"}},
+					}},
+					Target: schedulerv1alpha1.SchedulingTarget{SchedulerName: "kai-scheduler"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, jobPolicy)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, jobPolicy)
+			})
+
+			controllerReconciler := &SchedulingPolicyReconciler{
+				Client:   k8sClient,
+				policies: newSchedulingPolicyCache(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: jobPolicyName})
+			Expect(err).NotTo(HaveOccurred())
+
+			currentPolicy := &schedulerv1alpha1.SchedulingPolicy{}
+			Expect(k8sClient.Get(ctx, jobPolicyName, currentPolicy)).To(Succeed())
+			readyCondition := apiMeta.FindStatusCondition(currentPolicy.Status.Conditions, conditionTypeReady)
+			Expect(readyCondition).NotTo(BeNil())
+			Expect(readyCondition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCondition.Reason).To(Equal("UnsupportedSource"))
+			Expect(readyCondition.Message).To(ContainSubstring("batch/v1/Job"))
+		})
+
+		It("should mark replicaset sources as unsupported", func() {
+			replicaSetPolicyName := types.NamespacedName{Name: "replicaset-source-policy"}
+			replicaSetPolicy := &schedulerv1alpha1.SchedulingPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: replicaSetPolicyName.Name},
+				Spec: schedulerv1alpha1.SchedulingPolicySpec{
+					Sources: []schedulerv1alpha1.WorkloadSource{{
+						APIVersion: "apps/v1",
+						Kind:       "ReplicaSet",
+						Selector:   &metav1.LabelSelector{MatchLabels: map[string]string{"app": "test-resource"}},
+					}},
+					Target: schedulerv1alpha1.SchedulingTarget{SchedulerName: "kai-scheduler"},
+				},
+			}
+			Expect(k8sClient.Create(ctx, replicaSetPolicy)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, replicaSetPolicy)
+			})
+
+			controllerReconciler := &SchedulingPolicyReconciler{
+				Client:   k8sClient,
+				policies: newSchedulingPolicyCache(),
+			}
+
+			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: replicaSetPolicyName})
+			Expect(err).NotTo(HaveOccurred())
+
+			currentPolicy := &schedulerv1alpha1.SchedulingPolicy{}
+			Expect(k8sClient.Get(ctx, replicaSetPolicyName, currentPolicy)).To(Succeed())
+			readyCondition := apiMeta.FindStatusCondition(currentPolicy.Status.Conditions, conditionTypeReady)
+			Expect(readyCondition).NotTo(BeNil())
+			Expect(readyCondition.Status).To(Equal(metav1.ConditionFalse))
+			Expect(readyCondition.Reason).To(Equal("UnsupportedSource"))
+			Expect(readyCondition.Message).To(ContainSubstring("apps/v1/ReplicaSet"))
+		})
+
 		It("should not change existing workloads when reconciling a SchedulingPolicy", func() {
 			controllerReconciler := &SchedulingPolicyReconciler{
 				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
 			}
 
 			deploymentName := types.NamespacedName{Namespace: "default", Name: "existing-policy-target"}
@@ -128,19 +234,6 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 		})
 
 		It("should not hand off matching workloads after winner policy deletion", func() {
-			controllerReconciler := &SchedulingPolicyReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
-			deploymentReconciler := &workloadReconciler{
-				Client: controllerReconciler.Client,
-				target: "apps/v1/Deployment",
-				newObj: func() client.Object {
-					return &appsv1.Deployment{}
-				},
-				patch: controllerReconciler.patchDeploymentObject,
-			}
-
 			deploymentName := types.NamespacedName{Namespace: "default", Name: "test-deployment"}
 			deployment := &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{
@@ -208,7 +301,18 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 				_ = k8sClient.Delete(ctx, winnerPolicy)
 			})
 
-			_, err := deploymentReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: deploymentName})
+			policyCache, err := loadSchedulingPolicyCache(ctx, k8sClient)
+			Expect(err).NotTo(HaveOccurred())
+			controllerReconciler := &SchedulingPolicyReconciler{
+				Client:   k8sClient,
+				policies: policyCache,
+			}
+			deploymentReconciler := &workloadReconciler{
+				Client:   controllerReconciler.Client,
+				policies: controllerReconciler.policies,
+			}
+
+			_, err = deploymentReconciler.Reconcile(ctx, workloadRequestForKey(targetDeployment, deploymentName))
 			Expect(err).NotTo(HaveOccurred())
 
 			currentDeployment := &appsv1.Deployment{}
@@ -218,7 +322,7 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("queue", "batch-a"))
 			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("team", "research"))
 			Expect(currentDeployment.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, winnerPolicyName.Name))
-			Expect(currentDeployment.Spec.Template.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, winnerPolicyName.Name))
+			Expect(currentDeployment.Spec.Template.Annotations).NotTo(HaveKey(managedByPolicyAnnotation))
 
 			Expect(k8sClient.Delete(ctx, winnerPolicy)).To(Succeed())
 
@@ -231,18 +335,31 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("queue", "batch-a"))
 			Expect(currentDeployment.Spec.Template.Labels).To(HaveKeyWithValue("team", "research"))
 			Expect(currentDeployment.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, winnerPolicyName.Name))
-			Expect(currentDeployment.Spec.Template.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, winnerPolicyName.Name))
+			Expect(currentDeployment.Spec.Template.Annotations).NotTo(HaveKey(managedByPolicyAnnotation))
 		})
 
 		It("should select the highest priority matching policy", func() {
-			controllerReconciler := &SchedulingPolicyReconciler{}
+			deploymentName := types.NamespacedName{Namespace: "default", Name: "priority-target"}
 			deployment := &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "priority-target",
-					Namespace: "default",
+					Name:      deploymentName.Name,
+					Namespace: deploymentName.Namespace,
 					Labels:    map[string]string{"workflow-id": "example-workflow"},
 				},
+				Spec: appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "worker"}},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "main", Image: "busybox"}},
+						},
+					},
+				},
 			}
+			Expect(k8sClient.Create(ctx, deployment)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, deployment)
+			})
 			source := schedulerv1alpha1.WorkloadSource{
 				APIVersion: "apps/v1",
 				Kind:       "Deployment",
@@ -251,36 +368,78 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 			olderTime := metav1.NewTime(time.Date(2026, time.April, 22, 12, 0, 0, 0, time.UTC))
 			newerTime := metav1.NewTime(time.Date(2026, time.April, 22, 13, 0, 0, 0, time.UTC))
 
-			winner := controllerReconciler.selectWinningPolicy(deployment, source, []schedulerv1alpha1.SchedulingPolicy{
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: "older-low-priority", CreationTimestamp: olderTime},
-					Spec: schedulerv1alpha1.SchedulingPolicySpec{
-						Priority: 10,
-						Sources:  []schedulerv1alpha1.WorkloadSource{source},
+			lowPriorityPolicy := &schedulerv1alpha1.SchedulingPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "older-low-priority", CreationTimestamp: olderTime},
+				Spec: schedulerv1alpha1.SchedulingPolicySpec{
+					Priority: 10,
+					Sources:  []schedulerv1alpha1.WorkloadSource{source},
+					Target: schedulerv1alpha1.SchedulingTarget{
+						SchedulerName: "low-priority-scheduler",
 					},
 				},
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: "newer-high-priority", CreationTimestamp: newerTime},
-					Spec: schedulerv1alpha1.SchedulingPolicySpec{
-						Priority: 20,
-						Sources:  []schedulerv1alpha1.WorkloadSource{source},
+			}
+			highPriorityPolicy := &schedulerv1alpha1.SchedulingPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "newer-high-priority", CreationTimestamp: newerTime},
+				Spec: schedulerv1alpha1.SchedulingPolicySpec{
+					Priority: 20,
+					Sources:  []schedulerv1alpha1.WorkloadSource{source},
+					Target: schedulerv1alpha1.SchedulingTarget{
+						SchedulerName: "high-priority-scheduler",
 					},
 				},
+			}
+			Expect(k8sClient.Create(ctx, lowPriorityPolicy)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, lowPriorityPolicy)
+			})
+			Expect(k8sClient.Create(ctx, highPriorityPolicy)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, highPriorityPolicy)
 			})
 
-			Expect(winner).NotTo(BeNil())
-			Expect(winner.Name).To(Equal("newer-high-priority"))
+			policyCache, err := loadSchedulingPolicyCache(ctx, k8sClient)
+			Expect(err).NotTo(HaveOccurred())
+			deploymentReconciler := &workloadReconciler{
+				Client:   k8sClient,
+				policies: policyCache,
+			}
+
+			_, err = deploymentReconciler.Reconcile(ctx, workloadRequestForKey(targetDeployment, deploymentName))
+			Expect(err).NotTo(HaveOccurred())
+
+			currentDeployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, deploymentName, currentDeployment)).To(Succeed())
+			Expect(currentDeployment.Spec.Template.Spec.SchedulerName).To(Equal("high-priority-scheduler"))
+			Expect(currentDeployment.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, "newer-high-priority"))
 		})
 
 		It("should use creation timestamp when matching policy priorities are equal", func() {
-			controllerReconciler := &SchedulingPolicyReconciler{}
+			policyCache := newSchedulingPolicyCache()
+			deploymentReconciler := &workloadReconciler{
+				Client:   k8sClient,
+				policies: policyCache,
+			}
+			deploymentName := types.NamespacedName{Namespace: "default", Name: "timestamp-target"}
 			deployment := &appsv1.Deployment{
 				ObjectMeta: metav1.ObjectMeta{
-					Name:      "timestamp-target",
-					Namespace: "default",
+					Name:      deploymentName.Name,
+					Namespace: deploymentName.Namespace,
 					Labels:    map[string]string{"workflow-id": "example-workflow"},
 				},
+				Spec: appsv1.DeploymentSpec{
+					Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "worker"}},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "worker"}},
+						Spec: corev1.PodSpec{
+							Containers: []corev1.Container{{Name: "main", Image: "busybox"}},
+						},
+					},
+				},
 			}
+			Expect(k8sClient.Create(ctx, deployment)).To(Succeed())
+			DeferCleanup(func() {
+				_ = k8sClient.Delete(ctx, deployment)
+			})
 			source := schedulerv1alpha1.WorkloadSource{
 				APIVersion: "apps/v1",
 				Kind:       "Deployment",
@@ -289,25 +448,37 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 			olderTime := metav1.NewTime(time.Date(2026, time.April, 22, 12, 0, 0, 0, time.UTC))
 			newerTime := metav1.NewTime(time.Date(2026, time.April, 22, 13, 0, 0, 0, time.UTC))
 
-			winner := controllerReconciler.selectWinningPolicy(deployment, source, []schedulerv1alpha1.SchedulingPolicy{
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: "z-older-policy", CreationTimestamp: olderTime},
-					Spec: schedulerv1alpha1.SchedulingPolicySpec{
-						Priority: 50,
-						Sources:  []schedulerv1alpha1.WorkloadSource{source},
+			olderPolicy := &schedulerv1alpha1.SchedulingPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "z-older-policy", CreationTimestamp: olderTime},
+				Spec: schedulerv1alpha1.SchedulingPolicySpec{
+					Priority: 50,
+					Sources:  []schedulerv1alpha1.WorkloadSource{source},
+					Target: schedulerv1alpha1.SchedulingTarget{
+						SchedulerName: "older-policy-scheduler",
 					},
 				},
-				{
-					ObjectMeta: metav1.ObjectMeta{Name: "a-newer-policy", CreationTimestamp: newerTime},
-					Spec: schedulerv1alpha1.SchedulingPolicySpec{
-						Priority: 50,
-						Sources:  []schedulerv1alpha1.WorkloadSource{source},
+			}
+			newerPolicy := &schedulerv1alpha1.SchedulingPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "a-newer-policy", CreationTimestamp: newerTime},
+				Spec: schedulerv1alpha1.SchedulingPolicySpec{
+					Priority: 50,
+					Sources:  []schedulerv1alpha1.WorkloadSource{source},
+					Target: schedulerv1alpha1.SchedulingTarget{
+						SchedulerName: "newer-policy-scheduler",
 					},
 				},
-			})
+			}
+			policyCache.Upsert(*olderPolicy)
+			policyCache.Upsert(*newerPolicy)
 
-			Expect(winner).NotTo(BeNil())
-			Expect(winner.Name).To(Equal("z-older-policy"))
+			_, err := deploymentReconciler.Reconcile(ctx, workloadRequestForKey(targetDeployment, deploymentName))
+			Expect(err).NotTo(HaveOccurred())
+
+			currentDeployment := &appsv1.Deployment{}
+			Expect(k8sClient.Get(ctx, deploymentName, currentDeployment)).To(Succeed())
+			Expect(currentDeployment.Spec.Template.Spec.SchedulerName).To(Equal("older-policy-scheduler"))
+			Expect(currentDeployment.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, "z-older-policy"))
 		})
+
 	})
 })

@@ -24,6 +24,7 @@ import (
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
+	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
@@ -51,6 +52,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(schedulerv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(kservev1beta1.AddToScheme(scheme))
 	// +kubebuilder:scaffold:scheme
 }
 
@@ -204,7 +206,6 @@ func main() {
 
 	if err = (&controller.SchedulingPolicyReconciler{
 		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "SchedulingPolicy")
 		os.Exit(1)

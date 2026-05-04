@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
@@ -60,6 +61,8 @@ var _ = BeforeSuite(func() {
 
 	var err error
 	err = schedulerv1alpha1.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+	err = kservev1beta1.AddToScheme(scheme.Scheme)
 	Expect(err).NotTo(HaveOccurred())
 
 	// +kubebuilder:scaffold:scheme

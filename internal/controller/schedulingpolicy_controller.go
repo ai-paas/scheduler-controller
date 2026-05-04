@@ -21,19 +21,23 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 
+	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apiMeta "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	schedulerv1alpha1 "github.com/ai-paas/scheduler-controller/api/v1alpha1"
 )
@@ -42,50 +46,93 @@ const (
 	conditionTypeReady = "Ready"
 
 	managedByPolicyAnnotation = "ai-paas.org/scheduling-policy"
+	workloadRequestSeparator  = "|"
 )
 
 // SchedulingPolicyReconciler reconciles a SchedulingPolicy object
 type SchedulingPolicyReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	policies *schedulingPolicyCache
 }
 
 type workloadReconciler struct {
 	client.Client
-	target string
-	newObj func() client.Object
-	patch  func(context.Context, client.Object, *schedulerv1alpha1.SchedulingPolicy) (bool, error)
+	policies *schedulingPolicyCache
+}
+
+type workloadTarget string
+
+const (
+	targetReplicationController workloadTarget = "v1/ReplicationController"
+	targetDeployment            workloadTarget = "apps/v1/Deployment"
+	targetStatefulSet           workloadTarget = "apps/v1/StatefulSet"
+	targetDaemonSet             workloadTarget = "apps/v1/DaemonSet"
+	targetCronJob               workloadTarget = "batch/v1/CronJob"
+	targetInferenceService      workloadTarget = "serving.kserve.io/v1beta1/InferenceService"
+)
+
+type schedulingPolicyCache struct {
+	mu       sync.RWMutex
+	policies []schedulerv1alpha1.SchedulingPolicy
 }
 
 // +kubebuilder:rbac:groups=ai-paas.org,resources=schedulingpolicies,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=ai-paas.org,resources=schedulingpolicies/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=ai-paas.org,resources=schedulingpolicies/finalizers,verbs=update
-// +kubebuilder:rbac:groups="",resources=pods;replicationcontrollers,verbs=get;list;watch;patch;update
-// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets;daemonsets;replicasets,verbs=get;list;watch;patch;update
-// +kubebuilder:rbac:groups=batch,resources=jobs;cronjobs,verbs=get;list;watch;patch;update
+// +kubebuilder:rbac:groups="",resources=replicationcontrollers,verbs=get;list;watch;patch;update
+// +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets;daemonsets,verbs=get;list;watch;patch;update
+// +kubebuilder:rbac:groups=batch,resources=cronjobs,verbs=get;list;watch;patch;update
 // +kubebuilder:rbac:groups=serving.kserve.io,resources=inferenceservices,verbs=get;list;watch;patch;update
 
 func (r *SchedulingPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	logger := log.FromContext(ctx).WithValues("schedulingPolicy", req.Name)
+	if r.policies == nil {
+		r.policies = newSchedulingPolicyCache()
+	}
 
 	var policy schedulerv1alpha1.SchedulingPolicy
 	if err := r.Get(ctx, req.NamespacedName, &policy); err != nil {
+		if client.IgnoreNotFound(err) == nil {
+			r.policies.Delete(req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	policyCopy := policy.DeepCopy()
 	now := metav1.Now()
 	policy.Status.ObservedGeneration = policy.Generation
 	policy.Status.LastAppliedTime = &now
-	apiMeta.SetStatusCondition(&policy.Status.Conditions, metav1.Condition{
-		Type:               conditionTypeReady,
-		Status:             metav1.ConditionTrue,
-		Reason:             "PolicyObserved",
-		Message:            "policy observed; existing workloads are not changed by policy create or update",
-		ObservedGeneration: policy.Generation,
-		LastTransitionTime: now,
-	})
-	if err := r.Status().Patch(ctx, &policy, client.MergeFrom(policyCopy)); err != nil {
+	unsupportedSources := make([]string, 0)
+	for _, source := range policy.Spec.Sources {
+		target := sourceWorkloadTarget(source)
+		switch target {
+		case targetReplicationController, targetDeployment, targetStatefulSet, targetDaemonSet, targetCronJob, targetInferenceService:
+		default:
+			unsupportedSources = append(unsupportedSources, string(target))
+		}
+	}
+	sort.Strings(unsupportedSources)
+	if len(unsupportedSources) > 0 {
+		r.policies.Delete(req.Name)
+		apiMeta.SetStatusCondition(&policy.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             metav1.ConditionFalse,
+			Reason:             "UnsupportedSource",
+			Message:            fmt.Sprintf("unsupported scheduling policy sources: %v", unsupportedSources),
+			ObservedGeneration: policy.Generation,
+			LastTransitionTime: now,
+		})
+	} else {
+		r.policies.Upsert(policy)
+		apiMeta.SetStatusCondition(&policy.Status.Conditions, metav1.Condition{
+			Type:               conditionTypeReady,
+			Status:             metav1.ConditionTrue,
+			Reason:             "PolicyObserved",
+			Message:            "policy observed; existing workloads are not changed by policy create or update",
+			ObservedGeneration: policy.Generation,
+			LastTransitionTime: now,
+		})
+	}
+	if err := r.Status().Update(ctx, &policy); err != nil {
 		logger.Error(err, "unable to patch policy status")
 		return ctrl.Result{}, nil
 	}
@@ -95,25 +142,169 @@ func (r *SchedulingPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 }
 
 func (r *workloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	logger := log.FromContext(ctx).WithValues("workload", req.NamespacedName, "target", r.target)
-
-	obj := r.newObj()
-	if err := r.Get(ctx, req.NamespacedName, obj); err != nil {
-		return ctrl.Result{}, client.IgnoreNotFound(err)
-	}
-
-	var policies schedulerv1alpha1.SchedulingPolicyList
-	if err := r.List(ctx, &policies); err != nil {
-		logger.Error(err, "unable to list scheduling policies")
+	targetText, workloadName, ok := strings.Cut(req.Name, workloadRequestSeparator)
+	if !ok {
+		log.FromContext(ctx).Error(fmt.Errorf("malformed workload request %q", req.Name), "unable to resolve workload target")
 		return ctrl.Result{}, nil
 	}
 
-	winner := selectWinningPolicyForTarget(obj, r.target, policies.Items)
+	target := workloadTarget(targetText)
+	workloadKey := types.NamespacedName{Namespace: req.Namespace, Name: workloadName}
+	logger := log.FromContext(ctx).WithValues("workload", workloadKey, "target", target)
+
+	var obj client.Object
+	switch target {
+	case targetReplicationController:
+		obj = &corev1.ReplicationController{}
+	case targetDeployment:
+		obj = &appsv1.Deployment{}
+	case targetStatefulSet:
+		obj = &appsv1.StatefulSet{}
+	case targetDaemonSet:
+		obj = &appsv1.DaemonSet{}
+	case targetCronJob:
+		obj = &batchv1.CronJob{}
+	case targetInferenceService:
+		obj = &kservev1beta1.InferenceService{}
+	default:
+		logger.Error(fmt.Errorf("unsupported workload target %q", target), "unable to create workload object")
+		return ctrl.Result{}, nil
+	}
+
+	if err := r.Get(ctx, workloadKey, obj); err != nil {
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	policies := r.policies.List()
+
+	var winner *schedulerv1alpha1.SchedulingPolicy
+	for i := range policies {
+		matched := false
+		for _, source := range policies[i].Spec.Sources {
+			if sourceWorkloadTarget(source) != target {
+				continue
+			}
+			if len(source.Namespaces) > 0 {
+				matchedNamespace := false
+				for _, namespace := range source.Namespaces {
+					if namespace == obj.GetNamespace() {
+						matchedNamespace = true
+						break
+					}
+				}
+				if !matchedNamespace {
+					continue
+				}
+			}
+			if source.Selector != nil {
+				selector, err := metav1.LabelSelectorAsSelector(source.Selector)
+				if err != nil || !selector.Matches(labels.Set(obj.GetLabels())) {
+					continue
+				}
+			}
+			matched = true
+			break
+		}
+		if !matched {
+			continue
+		}
+		if winner == nil {
+			winner = &policies[i]
+			continue
+		}
+		if policies[i].Spec.Priority != winner.Spec.Priority {
+			if policies[i].Spec.Priority > winner.Spec.Priority {
+				winner = &policies[i]
+			}
+			continue
+		}
+		if !policies[i].CreationTimestamp.Equal(&winner.CreationTimestamp) {
+			if policies[i].CreationTimestamp.Before(&winner.CreationTimestamp) {
+				winner = &policies[i]
+			}
+			continue
+		}
+		if policies[i].Name < winner.Name {
+			winner = &policies[i]
+		}
+	}
 	if winner == nil {
 		return ctrl.Result{}, nil
 	}
 
-	changed, err := r.patch(ctx, obj, winner)
+	var changed bool
+	var err error
+	persist := true
+	fieldsList := make([]podSchedulingFields, 0, 3)
+	switch typed := obj.(type) {
+	case *corev1.ReplicationController:
+		if typed.Spec.Template == nil {
+			return ctrl.Result{}, nil
+		}
+		fieldsList = append(fieldsList, podSchedulingFields{
+			schedulerName:     &typed.Spec.Template.Spec.SchedulerName,
+			priorityClassName: &typed.Spec.Template.Spec.PriorityClassName,
+			labels:            &typed.Spec.Template.Labels,
+		})
+	case *appsv1.Deployment:
+		fieldsList = append(fieldsList, podSchedulingFields{
+			schedulerName:     &typed.Spec.Template.Spec.SchedulerName,
+			priorityClassName: &typed.Spec.Template.Spec.PriorityClassName,
+			labels:            &typed.Spec.Template.Labels,
+		})
+	case *appsv1.StatefulSet:
+		fieldsList = append(fieldsList, podSchedulingFields{
+			schedulerName:     &typed.Spec.Template.Spec.SchedulerName,
+			priorityClassName: &typed.Spec.Template.Spec.PriorityClassName,
+			labels:            &typed.Spec.Template.Labels,
+		})
+	case *appsv1.DaemonSet:
+		fieldsList = append(fieldsList, podSchedulingFields{
+			schedulerName:     &typed.Spec.Template.Spec.SchedulerName,
+			priorityClassName: &typed.Spec.Template.Spec.PriorityClassName,
+			labels:            &typed.Spec.Template.Labels,
+		})
+	case *batchv1.CronJob:
+		fieldsList = append(fieldsList, podSchedulingFields{
+			schedulerName:     &typed.Spec.JobTemplate.Spec.Template.Spec.SchedulerName,
+			priorityClassName: &typed.Spec.JobTemplate.Spec.Template.Spec.PriorityClassName,
+			labels:            &typed.Spec.JobTemplate.Spec.Template.Labels,
+		})
+	case *kservev1beta1.InferenceService:
+		persist = false
+		fieldsList = append(fieldsList, podSchedulingFields{
+			schedulerName:     &typed.Spec.Predictor.PodSpec.SchedulerName,
+			priorityClassName: &typed.Spec.Predictor.PodSpec.PriorityClassName,
+			labels:            &typed.Spec.Predictor.ComponentExtensionSpec.Labels,
+		})
+		if typed.Spec.Transformer != nil {
+			fieldsList = append(fieldsList, podSchedulingFields{
+				schedulerName:     &typed.Spec.Transformer.PodSpec.SchedulerName,
+				priorityClassName: &typed.Spec.Transformer.PodSpec.PriorityClassName,
+				labels:            &typed.Spec.Transformer.ComponentExtensionSpec.Labels,
+			})
+		}
+		if typed.Spec.Explainer != nil {
+			fieldsList = append(fieldsList, podSchedulingFields{
+				schedulerName:     &typed.Spec.Explainer.PodSpec.SchedulerName,
+				priorityClassName: &typed.Spec.Explainer.PodSpec.PriorityClassName,
+				labels:            &typed.Spec.Explainer.ComponentExtensionSpec.Labels,
+			})
+		}
+	default:
+		err = fmt.Errorf("unsupported workload object %T", obj)
+	}
+	for _, fields := range fieldsList {
+		var fieldChanged bool
+		fieldChanged, err = applyPolicyToPodScheduling(ctx, obj, fields, winner, r.Client, persist)
+		if err != nil {
+			break
+		}
+		changed = fieldChanged || changed
+	}
+	if err == nil && !persist && changed {
+		err = r.Client.Update(ctx, obj)
+	}
 	if err != nil {
 		logger.Error(err, "unable to patch workload scheduling", "policy", winner.Name)
 		return ctrl.Result{}, nil
@@ -124,712 +315,83 @@ func (r *workloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	return ctrl.Result{}, nil
 }
 
-func (r *SchedulingPolicyReconciler) enforceSource(
+func sourceWorkloadTarget(source schedulerv1alpha1.WorkloadSource) workloadTarget {
+	return workloadTarget(fmt.Sprintf("%s/%s", source.APIVersion, source.Kind))
+}
+
+func workloadRequestForKey(target workloadTarget, key types.NamespacedName) reconcile.Request {
+	return reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Namespace: key.Namespace,
+			Name:      string(target) + workloadRequestSeparator + key.Name,
+		},
+	}
+}
+
+func watchWorkload(b *builder.Builder, object client.Object, target workloadTarget) *builder.Builder {
+	return b.Watches(object, handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, obj client.Object) []reconcile.Request {
+		return []reconcile.Request{workloadRequestForKey(target, client.ObjectKeyFromObject(obj))}
+	}))
+}
+
+type podSchedulingFields struct {
+	schedulerName     *string
+	priorityClassName *string
+	labels            *map[string]string
+}
+
+func applyPolicyToPodScheduling(
 	ctx context.Context,
+	obj client.Object,
+	fields podSchedulingFields,
 	policy *schedulerv1alpha1.SchedulingPolicy,
-	allPolicies []schedulerv1alpha1.SchedulingPolicy,
-	source schedulerv1alpha1.WorkloadSource,
-) (int32, int32, error) {
-	selector, err := selectorFromSource(source)
-	if err != nil {
-		return 0, 0, fmt.Errorf("invalid source selector for %s: %w", normalizeTarget(source.APIVersion, source.Kind), err)
+	patcher client.Client,
+	persist bool,
+) (bool, error) {
+	changed := false
+	target := policy.Spec.Target
+	if target.SchedulerName != "" && *fields.schedulerName != target.SchedulerName {
+		*fields.schedulerName = target.SchedulerName
+		changed = true
 	}
-
-	switch normalizeTarget(source.APIVersion, source.Kind) {
-	case "v1/Pod":
-		return r.enforcePods(ctx, policy, allPolicies, selector, source)
-	case "v1/ReplicationController":
-		return r.enforceReplicationControllers(ctx, policy, allPolicies, selector, source)
-	case "apps/v1/Deployment":
-		return r.enforceDeployments(ctx, policy, allPolicies, selector, source)
-	case "apps/v1/ReplicaSet":
-		return r.enforceReplicaSets(ctx, policy, allPolicies, selector, source)
-	case "apps/v1/StatefulSet":
-		return r.enforceStatefulSets(ctx, policy, allPolicies, selector, source)
-	case "apps/v1/DaemonSet":
-		return r.enforceDaemonSets(ctx, policy, allPolicies, selector, source)
-	case "batch/v1/Job":
-		return r.enforceJobs(ctx, policy, allPolicies, selector, source)
-	case "batch/v1/CronJob":
-		return r.enforceCronJobs(ctx, policy, allPolicies, selector, source)
-	case "serving.kserve.io/v1beta1/InferenceService":
-		return r.enforceInferenceServices(ctx, policy, allPolicies, selector, source)
-	default:
-		return 0, 0, fmt.Errorf("unsupported source resource %s", normalizeTarget(source.APIVersion, source.Kind))
+	if target.PriorityClassName != "" && *fields.priorityClassName != target.PriorityClassName {
+		*fields.priorityClassName = target.PriorityClassName
+		changed = true
 	}
-}
-
-func (r *SchedulingPolicyReconciler) enforcePods(ctx context.Context, policy *schedulerv1alpha1.SchedulingPolicy, allPolicies []schedulerv1alpha1.SchedulingPolicy, selector labels.Selector, source schedulerv1alpha1.WorkloadSource) (int32, int32, error) {
-	items, err := r.listPods(ctx, source.Namespaces, selector)
-	if err != nil {
-		return 0, 0, err
-	}
-	var matched, patched int32
-	for i := range items {
-		matched++
-		if !r.isWinningPolicy(&items[i], source, allPolicies, policy.Name) {
-			continue
+	if len(target.Labels) > 0 {
+		currentLabels := *fields.labels
+		if currentLabels == nil {
+			currentLabels = make(map[string]string)
 		}
-		changed, patchErr := r.patchPodScheduling(ctx, &items[i], policy)
-		if patchErr != nil {
-			return matched, patched, patchErr
-		}
-		if changed {
-			patched++
-		}
-	}
-	return matched, patched, nil
-}
-
-func (r *SchedulingPolicyReconciler) enforceReplicationControllers(ctx context.Context, policy *schedulerv1alpha1.SchedulingPolicy, allPolicies []schedulerv1alpha1.SchedulingPolicy, selector labels.Selector, source schedulerv1alpha1.WorkloadSource) (int32, int32, error) {
-	items, err := r.listReplicationControllers(ctx, source.Namespaces, selector)
-	if err != nil {
-		return 0, 0, err
-	}
-	var matched, patched int32
-	for i := range items {
-		matched++
-		if !r.isWinningPolicy(&items[i], source, allPolicies, policy.Name) {
-			continue
-		}
-		changed, patchErr := r.patchReplicationControllerScheduling(ctx, &items[i], policy)
-		if patchErr != nil {
-			return matched, patched, patchErr
-		}
-		if changed {
-			patched++
-		}
-	}
-	return matched, patched, nil
-}
-
-func (r *SchedulingPolicyReconciler) enforceDeployments(ctx context.Context, policy *schedulerv1alpha1.SchedulingPolicy, allPolicies []schedulerv1alpha1.SchedulingPolicy, selector labels.Selector, source schedulerv1alpha1.WorkloadSource) (int32, int32, error) {
-	items, err := r.listDeployments(ctx, source.Namespaces, selector)
-	if err != nil {
-		return 0, 0, err
-	}
-	var matched, patched int32
-	for i := range items {
-		matched++
-		if !r.isWinningPolicy(&items[i], source, allPolicies, policy.Name) {
-			continue
-		}
-		changed, patchErr := r.patchDeploymentScheduling(ctx, &items[i], policy)
-		if patchErr != nil {
-			return matched, patched, patchErr
-		}
-		if changed {
-			patched++
-		}
-	}
-	return matched, patched, nil
-}
-
-func (r *SchedulingPolicyReconciler) enforceReplicaSets(ctx context.Context, policy *schedulerv1alpha1.SchedulingPolicy, allPolicies []schedulerv1alpha1.SchedulingPolicy, selector labels.Selector, source schedulerv1alpha1.WorkloadSource) (int32, int32, error) {
-	items, err := r.listReplicaSets(ctx, source.Namespaces, selector)
-	if err != nil {
-		return 0, 0, err
-	}
-	var matched, patched int32
-	for i := range items {
-		matched++
-		if !r.isWinningPolicy(&items[i], source, allPolicies, policy.Name) {
-			continue
-		}
-		changed, patchErr := r.patchReplicaSetScheduling(ctx, &items[i], policy)
-		if patchErr != nil {
-			return matched, patched, patchErr
-		}
-		if changed {
-			patched++
-		}
-	}
-	return matched, patched, nil
-}
-
-func (r *SchedulingPolicyReconciler) enforceStatefulSets(ctx context.Context, policy *schedulerv1alpha1.SchedulingPolicy, allPolicies []schedulerv1alpha1.SchedulingPolicy, selector labels.Selector, source schedulerv1alpha1.WorkloadSource) (int32, int32, error) {
-	items, err := r.listStatefulSets(ctx, source.Namespaces, selector)
-	if err != nil {
-		return 0, 0, err
-	}
-	var matched, patched int32
-	for i := range items {
-		matched++
-		if !r.isWinningPolicy(&items[i], source, allPolicies, policy.Name) {
-			continue
-		}
-		changed, patchErr := r.patchStatefulSetScheduling(ctx, &items[i], policy)
-		if patchErr != nil {
-			return matched, patched, patchErr
-		}
-		if changed {
-			patched++
-		}
-	}
-	return matched, patched, nil
-}
-
-func (r *SchedulingPolicyReconciler) enforceDaemonSets(ctx context.Context, policy *schedulerv1alpha1.SchedulingPolicy, allPolicies []schedulerv1alpha1.SchedulingPolicy, selector labels.Selector, source schedulerv1alpha1.WorkloadSource) (int32, int32, error) {
-	items, err := r.listDaemonSets(ctx, source.Namespaces, selector)
-	if err != nil {
-		return 0, 0, err
-	}
-	var matched, patched int32
-	for i := range items {
-		matched++
-		if !r.isWinningPolicy(&items[i], source, allPolicies, policy.Name) {
-			continue
-		}
-		changed, patchErr := r.patchDaemonSetScheduling(ctx, &items[i], policy)
-		if patchErr != nil {
-			return matched, patched, patchErr
-		}
-		if changed {
-			patched++
-		}
-	}
-	return matched, patched, nil
-}
-
-func (r *SchedulingPolicyReconciler) enforceJobs(ctx context.Context, policy *schedulerv1alpha1.SchedulingPolicy, allPolicies []schedulerv1alpha1.SchedulingPolicy, selector labels.Selector, source schedulerv1alpha1.WorkloadSource) (int32, int32, error) {
-	items, err := r.listJobs(ctx, source.Namespaces, selector)
-	if err != nil {
-		return 0, 0, err
-	}
-	var matched, patched int32
-	for i := range items {
-		matched++
-		if !r.isWinningPolicy(&items[i], source, allPolicies, policy.Name) {
-			continue
-		}
-		changed, patchErr := r.patchJobScheduling(ctx, &items[i], policy)
-		if patchErr != nil {
-			return matched, patched, patchErr
-		}
-		if changed {
-			patched++
-		}
-	}
-	return matched, patched, nil
-}
-
-func (r *SchedulingPolicyReconciler) enforceCronJobs(ctx context.Context, policy *schedulerv1alpha1.SchedulingPolicy, allPolicies []schedulerv1alpha1.SchedulingPolicy, selector labels.Selector, source schedulerv1alpha1.WorkloadSource) (int32, int32, error) {
-	items, err := r.listCronJobs(ctx, source.Namespaces, selector)
-	if err != nil {
-		return 0, 0, err
-	}
-	var matched, patched int32
-	for i := range items {
-		matched++
-		if !r.isWinningPolicy(&items[i], source, allPolicies, policy.Name) {
-			continue
-		}
-		changed, patchErr := r.patchCronJobScheduling(ctx, &items[i], policy)
-		if patchErr != nil {
-			return matched, patched, patchErr
-		}
-		if changed {
-			patched++
-		}
-	}
-	return matched, patched, nil
-}
-
-func (r *SchedulingPolicyReconciler) enforceInferenceServices(ctx context.Context, policy *schedulerv1alpha1.SchedulingPolicy, allPolicies []schedulerv1alpha1.SchedulingPolicy, selector labels.Selector, source schedulerv1alpha1.WorkloadSource) (int32, int32, error) {
-	items, err := r.listInferenceServices(ctx, source.Namespaces, selector)
-	if err != nil {
-		return 0, 0, err
-	}
-	var matched, patched int32
-	for i := range items {
-		matched++
-		if !r.isWinningPolicy(&items[i], source, allPolicies, policy.Name) {
-			continue
-		}
-		changed, patchErr := r.patchInferenceServiceScheduling(ctx, &items[i], policy)
-		if patchErr != nil {
-			return matched, patched, patchErr
-		}
-		if changed {
-			patched++
-		}
-	}
-	return matched, patched, nil
-}
-
-func (r *SchedulingPolicyReconciler) listDeployments(ctx context.Context, namespaces []string, selector labels.Selector) ([]appsv1.Deployment, error) {
-	if len(namespaces) == 0 {
-		var list appsv1.DeploymentList
-		if err := r.List(ctx, &list, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		return list.Items, nil
-	}
-	items := make([]appsv1.Deployment, 0)
-	for _, namespace := range namespaces {
-		var list appsv1.DeploymentList
-		if err := r.List(ctx, &list, &client.ListOptions{Namespace: namespace, LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		items = append(items, list.Items...)
-	}
-	return items, nil
-}
-
-func (r *SchedulingPolicyReconciler) listPods(ctx context.Context, namespaces []string, selector labels.Selector) ([]corev1.Pod, error) {
-	if len(namespaces) == 0 {
-		var list corev1.PodList
-		if err := r.List(ctx, &list, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		return list.Items, nil
-	}
-	items := make([]corev1.Pod, 0)
-	for _, namespace := range namespaces {
-		var list corev1.PodList
-		if err := r.List(ctx, &list, &client.ListOptions{Namespace: namespace, LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		items = append(items, list.Items...)
-	}
-	return items, nil
-}
-
-func (r *SchedulingPolicyReconciler) listReplicationControllers(ctx context.Context, namespaces []string, selector labels.Selector) ([]corev1.ReplicationController, error) {
-	if len(namespaces) == 0 {
-		var list corev1.ReplicationControllerList
-		if err := r.List(ctx, &list, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		return list.Items, nil
-	}
-	items := make([]corev1.ReplicationController, 0)
-	for _, namespace := range namespaces {
-		var list corev1.ReplicationControllerList
-		if err := r.List(ctx, &list, &client.ListOptions{Namespace: namespace, LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		items = append(items, list.Items...)
-	}
-	return items, nil
-}
-
-func (r *SchedulingPolicyReconciler) listReplicaSets(ctx context.Context, namespaces []string, selector labels.Selector) ([]appsv1.ReplicaSet, error) {
-	if len(namespaces) == 0 {
-		var list appsv1.ReplicaSetList
-		if err := r.List(ctx, &list, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		return list.Items, nil
-	}
-	items := make([]appsv1.ReplicaSet, 0)
-	for _, namespace := range namespaces {
-		var list appsv1.ReplicaSetList
-		if err := r.List(ctx, &list, &client.ListOptions{Namespace: namespace, LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		items = append(items, list.Items...)
-	}
-	return items, nil
-}
-
-func (r *SchedulingPolicyReconciler) listStatefulSets(ctx context.Context, namespaces []string, selector labels.Selector) ([]appsv1.StatefulSet, error) {
-	if len(namespaces) == 0 {
-		var list appsv1.StatefulSetList
-		if err := r.List(ctx, &list, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		return list.Items, nil
-	}
-	items := make([]appsv1.StatefulSet, 0)
-	for _, namespace := range namespaces {
-		var list appsv1.StatefulSetList
-		if err := r.List(ctx, &list, &client.ListOptions{Namespace: namespace, LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		items = append(items, list.Items...)
-	}
-	return items, nil
-}
-
-func (r *SchedulingPolicyReconciler) listDaemonSets(ctx context.Context, namespaces []string, selector labels.Selector) ([]appsv1.DaemonSet, error) {
-	if len(namespaces) == 0 {
-		var list appsv1.DaemonSetList
-		if err := r.List(ctx, &list, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		return list.Items, nil
-	}
-	items := make([]appsv1.DaemonSet, 0)
-	for _, namespace := range namespaces {
-		var list appsv1.DaemonSetList
-		if err := r.List(ctx, &list, &client.ListOptions{Namespace: namespace, LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		items = append(items, list.Items...)
-	}
-	return items, nil
-}
-
-func (r *SchedulingPolicyReconciler) listJobs(ctx context.Context, namespaces []string, selector labels.Selector) ([]batchv1.Job, error) {
-	if len(namespaces) == 0 {
-		var list batchv1.JobList
-		if err := r.List(ctx, &list, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		return list.Items, nil
-	}
-	items := make([]batchv1.Job, 0)
-	for _, namespace := range namespaces {
-		var list batchv1.JobList
-		if err := r.List(ctx, &list, &client.ListOptions{Namespace: namespace, LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		items = append(items, list.Items...)
-	}
-	return items, nil
-}
-
-func (r *SchedulingPolicyReconciler) listCronJobs(ctx context.Context, namespaces []string, selector labels.Selector) ([]batchv1.CronJob, error) {
-	if len(namespaces) == 0 {
-		var list batchv1.CronJobList
-		if err := r.List(ctx, &list, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		return list.Items, nil
-	}
-	items := make([]batchv1.CronJob, 0)
-	for _, namespace := range namespaces {
-		var list batchv1.CronJobList
-		if err := r.List(ctx, &list, &client.ListOptions{Namespace: namespace, LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		items = append(items, list.Items...)
-	}
-	return items, nil
-}
-
-func (r *SchedulingPolicyReconciler) listInferenceServices(ctx context.Context, namespaces []string, selector labels.Selector) ([]unstructured.Unstructured, error) {
-	newList := func() *unstructured.UnstructuredList {
-		list := &unstructured.UnstructuredList{}
-		list.SetAPIVersion("serving.kserve.io/v1beta1")
-		list.SetKind("InferenceServiceList")
-		return list
-	}
-	if len(namespaces) == 0 {
-		list := newList()
-		if err := r.List(ctx, list, &client.ListOptions{LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		return list.Items, nil
-	}
-	items := make([]unstructured.Unstructured, 0)
-	for _, namespace := range namespaces {
-		list := newList()
-		if err := r.List(ctx, list, &client.ListOptions{Namespace: namespace, LabelSelector: selector}); err != nil {
-			return nil, err
-		}
-		items = append(items, list.Items...)
-	}
-	return items, nil
-}
-
-func (r *SchedulingPolicyReconciler) patchPodScheduling(ctx context.Context, obj *corev1.Pod, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	base := obj.DeepCopy()
-	if !applyTargetToPod(obj, policy) {
-		return false, nil
-	}
-	return true, r.Patch(ctx, obj, client.MergeFrom(base))
-}
-
-func (r *SchedulingPolicyReconciler) patchReplicationControllerScheduling(ctx context.Context, obj *corev1.ReplicationController, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	if obj.Spec.Template == nil {
-		return false, nil
-	}
-	base := obj.DeepCopy()
-	if !applyTargetToWorkloadTemplate(obj, obj.Spec.Template, policy) {
-		return false, nil
-	}
-	return true, r.Patch(ctx, obj, client.MergeFrom(base))
-}
-
-func (r *SchedulingPolicyReconciler) patchDeploymentScheduling(ctx context.Context, obj *appsv1.Deployment, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	base := obj.DeepCopy()
-	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.Template, policy) {
-		return false, nil
-	}
-	return true, r.Patch(ctx, obj, client.MergeFrom(base))
-}
-
-func (r *SchedulingPolicyReconciler) patchReplicaSetScheduling(ctx context.Context, obj *appsv1.ReplicaSet, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	base := obj.DeepCopy()
-	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.Template, policy) {
-		return false, nil
-	}
-	return true, r.Patch(ctx, obj, client.MergeFrom(base))
-}
-
-func (r *SchedulingPolicyReconciler) patchStatefulSetScheduling(ctx context.Context, obj *appsv1.StatefulSet, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	base := obj.DeepCopy()
-	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.Template, policy) {
-		return false, nil
-	}
-	return true, r.Patch(ctx, obj, client.MergeFrom(base))
-}
-
-func (r *SchedulingPolicyReconciler) patchDaemonSetScheduling(ctx context.Context, obj *appsv1.DaemonSet, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	base := obj.DeepCopy()
-	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.Template, policy) {
-		return false, nil
-	}
-	return true, r.Patch(ctx, obj, client.MergeFrom(base))
-}
-
-func (r *SchedulingPolicyReconciler) patchJobScheduling(ctx context.Context, obj *batchv1.Job, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	base := obj.DeepCopy()
-	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.Template, policy) {
-		return false, nil
-	}
-	return true, r.Patch(ctx, obj, client.MergeFrom(base))
-}
-
-func (r *SchedulingPolicyReconciler) patchCronJobScheduling(ctx context.Context, obj *batchv1.CronJob, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	base := obj.DeepCopy()
-	if !applyTargetToWorkloadTemplate(obj, &obj.Spec.JobTemplate.Spec.Template, policy) {
-		return false, nil
-	}
-	return true, r.Patch(ctx, obj, client.MergeFrom(base))
-}
-
-func (r *SchedulingPolicyReconciler) patchInferenceServiceScheduling(ctx context.Context, obj *unstructured.Unstructured, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	base := obj.DeepCopy()
-	changed := applyManagingPolicyAnnotationToObject(obj, policy.Name)
-	for _, component := range []string{"predictor", "transformer", "explainer"} {
-		componentChanged, err := applyTargetToInferenceServiceComponent(obj, component, policy)
-		if err != nil {
-			return false, err
-		}
-		changed = changed || componentChanged
-	}
-	if !changed {
-		return false, nil
-	}
-	return true, r.Patch(ctx, obj, client.MergeFrom(base))
-}
-
-func (r *SchedulingPolicyReconciler) patchPodObject(ctx context.Context, obj client.Object, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	typed, ok := obj.(*corev1.Pod)
-	if !ok {
-		return false, fmt.Errorf("expected *corev1.Pod, got %T", obj)
-	}
-	return r.patchPodScheduling(ctx, typed, policy)
-}
-
-func (r *SchedulingPolicyReconciler) patchReplicationControllerObject(ctx context.Context, obj client.Object, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	typed, ok := obj.(*corev1.ReplicationController)
-	if !ok {
-		return false, fmt.Errorf("expected *corev1.ReplicationController, got %T", obj)
-	}
-	return r.patchReplicationControllerScheduling(ctx, typed, policy)
-}
-
-func (r *SchedulingPolicyReconciler) patchDeploymentObject(ctx context.Context, obj client.Object, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	typed, ok := obj.(*appsv1.Deployment)
-	if !ok {
-		return false, fmt.Errorf("expected *appsv1.Deployment, got %T", obj)
-	}
-	return r.patchDeploymentScheduling(ctx, typed, policy)
-}
-
-func (r *SchedulingPolicyReconciler) patchReplicaSetObject(ctx context.Context, obj client.Object, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	typed, ok := obj.(*appsv1.ReplicaSet)
-	if !ok {
-		return false, fmt.Errorf("expected *appsv1.ReplicaSet, got %T", obj)
-	}
-	return r.patchReplicaSetScheduling(ctx, typed, policy)
-}
-
-func (r *SchedulingPolicyReconciler) patchStatefulSetObject(ctx context.Context, obj client.Object, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	typed, ok := obj.(*appsv1.StatefulSet)
-	if !ok {
-		return false, fmt.Errorf("expected *appsv1.StatefulSet, got %T", obj)
-	}
-	return r.patchStatefulSetScheduling(ctx, typed, policy)
-}
-
-func (r *SchedulingPolicyReconciler) patchDaemonSetObject(ctx context.Context, obj client.Object, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	typed, ok := obj.(*appsv1.DaemonSet)
-	if !ok {
-		return false, fmt.Errorf("expected *appsv1.DaemonSet, got %T", obj)
-	}
-	return r.patchDaemonSetScheduling(ctx, typed, policy)
-}
-
-func (r *SchedulingPolicyReconciler) patchJobObject(ctx context.Context, obj client.Object, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	typed, ok := obj.(*batchv1.Job)
-	if !ok {
-		return false, fmt.Errorf("expected *batchv1.Job, got %T", obj)
-	}
-	return r.patchJobScheduling(ctx, typed, policy)
-}
-
-func (r *SchedulingPolicyReconciler) patchCronJobObject(ctx context.Context, obj client.Object, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	typed, ok := obj.(*batchv1.CronJob)
-	if !ok {
-		return false, fmt.Errorf("expected *batchv1.CronJob, got %T", obj)
-	}
-	return r.patchCronJobScheduling(ctx, typed, policy)
-}
-
-func (r *SchedulingPolicyReconciler) patchInferenceServiceObject(ctx context.Context, obj client.Object, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	typed, ok := obj.(*unstructured.Unstructured)
-	if !ok {
-		return false, fmt.Errorf("expected *unstructured.Unstructured, got %T", obj)
-	}
-	return r.patchInferenceServiceScheduling(ctx, typed, policy)
-}
-
-func (r *SchedulingPolicyReconciler) isWinningPolicy(obj client.Object, source schedulerv1alpha1.WorkloadSource, allPolicies []schedulerv1alpha1.SchedulingPolicy, currentName string) bool {
-	winner := r.selectWinningPolicy(obj, source, allPolicies)
-	return winner != nil && winner.Name == currentName
-}
-
-func (r *SchedulingPolicyReconciler) selectWinningPolicy(obj client.Object, source schedulerv1alpha1.WorkloadSource, allPolicies []schedulerv1alpha1.SchedulingPolicy) *schedulerv1alpha1.SchedulingPolicy {
-	return selectWinningPolicyForTarget(obj, normalizeTarget(source.APIVersion, source.Kind), allPolicies)
-}
-
-func selectWinningPolicyForTarget(obj client.Object, wantedSource string, allPolicies []schedulerv1alpha1.SchedulingPolicy) *schedulerv1alpha1.SchedulingPolicy {
-	matched := make([]*schedulerv1alpha1.SchedulingPolicy, 0)
-	for i := range allPolicies {
-		policy := &allPolicies[i]
-		if !policyMatchesObject(policy, wantedSource, obj) {
-			continue
-		}
-		matched = append(matched, policy)
-	}
-	if len(matched) == 0 {
-		return nil
-	}
-	sort.SliceStable(matched, func(i, j int) bool {
-		if matched[i].Spec.Priority != matched[j].Spec.Priority {
-			return matched[i].Spec.Priority > matched[j].Spec.Priority
-		}
-		if !matched[i].CreationTimestamp.Equal(&matched[j].CreationTimestamp) {
-			return matched[i].CreationTimestamp.Before(&matched[j].CreationTimestamp)
-		}
-		return matched[i].Name < matched[j].Name
-	})
-	return matched[0]
-}
-
-func policyMatchesObject(policy *schedulerv1alpha1.SchedulingPolicy, wantedSource string, obj client.Object) bool {
-	for _, source := range policy.Spec.Sources {
-		if !sourceMatchesObject(source, wantedSource, obj) {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-func sourceMatchesObject(source schedulerv1alpha1.WorkloadSource, wantedSource string, obj client.Object) bool {
-	if normalizeTarget(source.APIVersion, source.Kind) != wantedSource {
-		return false
-	}
-	if len(source.Namespaces) > 0 {
-		matchedNamespace := false
-		for _, namespace := range source.Namespaces {
-			if namespace == obj.GetNamespace() {
-				matchedNamespace = true
-				break
+		labelChanged := false
+		for key, value := range target.Labels {
+			if value == "" || currentLabels[key] == value {
+				continue
 			}
+			currentLabels[key] = value
+			labelChanged = true
 		}
-		if !matchedNamespace {
-			return false
+		if labelChanged {
+			*fields.labels = currentLabels
+			changed = true
 		}
 	}
-	selector, err := selectorFromSource(source)
-	if err != nil {
-		return false
+	objectMetaChanged := false
+	objectAnnotations := obj.GetAnnotations()
+	objectMetaChanged, objectAnnotations = applyManagingPolicyAnnotation(objectAnnotations, policy.Name)
+	if objectMetaChanged {
+		obj.SetAnnotations(objectAnnotations)
 	}
-	return selector.Matches(labels.Set(obj.GetLabels()))
-}
-
-func selectorFromSource(source schedulerv1alpha1.WorkloadSource) (labels.Selector, error) {
-	if source.Selector == nil {
-		return labels.Everything(), nil
-	}
-	return metav1.LabelSelectorAsSelector(source.Selector)
-}
-
-func applyTargetToPod(obj *corev1.Pod, policy *schedulerv1alpha1.SchedulingPolicy) bool {
-	changed := applyTargetToPodSpec(&obj.Spec, policy.Spec.Target)
-	changed = applyTargetToLabels(&obj.Labels, policy.Spec.Target) || changed
-	return applyManagingPolicyAnnotationToObject(obj, policy.Name) || changed
-}
-
-func applyTargetToWorkloadTemplate(workload client.Object, template *corev1.PodTemplateSpec, policy *schedulerv1alpha1.SchedulingPolicy) bool {
-	changed := applyTargetToPodTemplate(template, policy)
-	return applyManagingPolicyAnnotationToObject(workload, policy.Name) || changed
-}
-
-func applyTargetToPodTemplate(template *corev1.PodTemplateSpec, policy *schedulerv1alpha1.SchedulingPolicy) bool {
-	changed := applyTargetToPodSpec(&template.Spec, policy.Spec.Target)
-	changed = applyTargetToLabels(&template.Labels, policy.Spec.Target) || changed
-	return applyManagingPolicyAnnotationToMeta(&template.ObjectMeta, policy.Name) || changed
-}
-
-func applyTargetToPodSpec(spec *corev1.PodSpec, target schedulerv1alpha1.SchedulingTarget) bool {
-	changed := false
-	if shouldSetValue(spec.SchedulerName, target.SchedulerName) {
-		spec.SchedulerName = target.SchedulerName
-		changed = true
-	}
-	if shouldSetValue(spec.PriorityClassName, target.PriorityClassName) {
-		spec.PriorityClassName = target.PriorityClassName
-		changed = true
-	}
-	return changed
-}
-
-func applyTargetToLabels(labelSet *map[string]string, target schedulerv1alpha1.SchedulingTarget) bool {
-	if len(target.Labels) == 0 {
-		return false
-	}
-	currentLabels := *labelSet
-	if currentLabels == nil {
-		currentLabels = make(map[string]string)
-	}
-	changed := false
-	for key, value := range target.Labels {
-		if !shouldSetValue(currentLabels[key], value) {
-			continue
-		}
-		currentLabels[key] = value
-		changed = true
-	}
+	changed = objectMetaChanged || changed
 	if !changed {
-		return false
+		return false, nil
 	}
-	*labelSet = currentLabels
-	return true
-}
-
-func applyManagingPolicyAnnotationToObject(obj client.Object, policyName string) bool {
-	annotations := obj.GetAnnotations()
-	changed, annotations := applyManagingPolicyAnnotation(annotations, policyName)
-	if changed {
-		obj.SetAnnotations(annotations)
+	if !persist {
+		return true, nil
 	}
-	return changed
-}
 
-func applyManagingPolicyAnnotationToMeta(meta *metav1.ObjectMeta, policyName string) bool {
-	changed, annotations := applyManagingPolicyAnnotation(meta.Annotations, policyName)
-	meta.Annotations = annotations
-	return changed
+	return true, patcher.Update(ctx, obj)
 }
-
 func applyManagingPolicyAnnotation(annotations map[string]string, policyName string) (bool, map[string]string) {
 	if annotations == nil {
 		annotations = make(map[string]string)
@@ -841,80 +403,65 @@ func applyManagingPolicyAnnotation(annotations map[string]string, policyName str
 	return true, annotations
 }
 
-func applyTargetToInferenceServiceComponent(obj *unstructured.Unstructured, component string, policy *schedulerv1alpha1.SchedulingPolicy) (bool, error) {
-	componentMap, found, err := unstructured.NestedMap(obj.Object, "spec", component)
-	if err != nil {
-		return false, err
-	}
-	if !found {
-		if component != "predictor" {
-			return false, nil
-		}
-		componentMap = map[string]interface{}{}
-	}
-
-	changed := false
-	if shouldSetValue(asString(componentMap["schedulerName"]), policy.Spec.Target.SchedulerName) {
-		componentMap["schedulerName"] = policy.Spec.Target.SchedulerName
-		changed = true
-	}
-	if shouldSetValue(asString(componentMap["priorityClassName"]), policy.Spec.Target.PriorityClassName) {
-		componentMap["priorityClassName"] = policy.Spec.Target.PriorityClassName
-		changed = true
-	}
-	if len(policy.Spec.Target.Labels) > 0 {
-		labelMap, _ := componentMap["labels"].(map[string]interface{})
-		if labelMap == nil {
-			labelMap = map[string]interface{}{}
-		}
-		for key, value := range policy.Spec.Target.Labels {
-			if !shouldSetValue(asString(labelMap[key]), value) {
-				continue
-			}
-			labelMap[key] = value
-			changed = true
-		}
-		componentMap["labels"] = labelMap
-	}
-	annotationsMap, _ := componentMap["annotations"].(map[string]interface{})
-	if annotationsMap == nil {
-		annotationsMap = map[string]interface{}{}
-	}
-	if shouldSetValue(asString(annotationsMap[managedByPolicyAnnotation]), policy.Name) {
-		annotationsMap[managedByPolicyAnnotation] = policy.Name
-		componentMap["annotations"] = annotationsMap
-		changed = true
-	}
-	if !changed {
-		return false, nil
-	}
-	if err := unstructured.SetNestedMap(obj.Object, componentMap, "spec", component); err != nil {
-		return false, err
-	}
-	return true, nil
+func newSchedulingPolicyCache() *schedulingPolicyCache {
+	return &schedulingPolicyCache{}
 }
 
-func asString(value interface{}) string {
-	stringValue, ok := value.(string)
-	if !ok {
-		return ""
+func loadSchedulingPolicyCache(ctx context.Context, reader client.Reader) (*schedulingPolicyCache, error) {
+	var list schedulerv1alpha1.SchedulingPolicyList
+	if err := reader.List(ctx, &list); err != nil {
+		return nil, err
 	}
-	return stringValue
+
+	cache := newSchedulingPolicyCache()
+	cache.policies = append(cache.policies, list.Items...)
+	return cache, nil
 }
 
-func shouldSetValue(current, desired string) bool {
-	if desired == "" || current == desired {
-		return false
+func (c *schedulingPolicyCache) Upsert(policy schedulerv1alpha1.SchedulingPolicy) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for i := range c.policies {
+		if c.policies[i].Name != policy.Name {
+			continue
+		}
+		c.policies[i] = policy
+		return
 	}
-	return true
+	c.policies = append(c.policies, policy)
 }
 
-func normalizeTarget(apiVersion, kind string) string {
-	return fmt.Sprintf("%s/%s", strings.TrimSpace(apiVersion), strings.TrimSpace(kind))
+func (c *schedulingPolicyCache) Delete(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for i := range c.policies {
+		if c.policies[i].Name != name {
+			continue
+		}
+		c.policies = append(c.policies[:i], c.policies[i+1:]...)
+		break
+	}
+}
+
+func (c *schedulingPolicyCache) List() []schedulerv1alpha1.SchedulingPolicy {
+	c.mu.RLock()
+	policies := append([]schedulerv1alpha1.SchedulingPolicy(nil), c.policies...)
+	c.mu.RUnlock()
+	return policies
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *SchedulingPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.policies == nil {
+		policies, err := loadSchedulingPolicyCache(context.Background(), mgr.GetAPIReader())
+		if err != nil {
+			return err
+		}
+		r.policies = policies
+	}
+
 	if err := ctrl.NewControllerManagedBy(mgr).
 		For(&schedulerv1alpha1.SchedulingPolicy{}).
 		WithEventFilter(predicate.GenerationChangedPredicate{}).
@@ -923,77 +470,20 @@ func (r *SchedulingPolicyReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 
-	if err := r.setupWorkloadController(mgr, "schedulingpolicy-pod", &corev1.Pod{}, "v1/Pod", func() client.Object {
-		return &corev1.Pod{}
-	}, r.patchPodObject); err != nil {
-		return err
-	}
-	if err := r.setupWorkloadController(mgr, "schedulingpolicy-replicationcontroller", &corev1.ReplicationController{}, "v1/ReplicationController", func() client.Object {
-		return &corev1.ReplicationController{}
-	}, r.patchReplicationControllerObject); err != nil {
-		return err
-	}
-	if err := r.setupWorkloadController(mgr, "schedulingpolicy-deployment", &appsv1.Deployment{}, "apps/v1/Deployment", func() client.Object {
-		return &appsv1.Deployment{}
-	}, r.patchDeploymentObject); err != nil {
-		return err
-	}
-	if err := r.setupWorkloadController(mgr, "schedulingpolicy-replicaset", &appsv1.ReplicaSet{}, "apps/v1/ReplicaSet", func() client.Object {
-		return &appsv1.ReplicaSet{}
-	}, r.patchReplicaSetObject); err != nil {
-		return err
-	}
-	if err := r.setupWorkloadController(mgr, "schedulingpolicy-statefulset", &appsv1.StatefulSet{}, "apps/v1/StatefulSet", func() client.Object {
-		return &appsv1.StatefulSet{}
-	}, r.patchStatefulSetObject); err != nil {
-		return err
-	}
-	if err := r.setupWorkloadController(mgr, "schedulingpolicy-daemonset", &appsv1.DaemonSet{}, "apps/v1/DaemonSet", func() client.Object {
-		return &appsv1.DaemonSet{}
-	}, r.patchDaemonSetObject); err != nil {
-		return err
-	}
-	if err := r.setupWorkloadController(mgr, "schedulingpolicy-job", &batchv1.Job{}, "batch/v1/Job", func() client.Object {
-		return &batchv1.Job{}
-	}, r.patchJobObject); err != nil {
-		return err
-	}
-	if err := r.setupWorkloadController(mgr, "schedulingpolicy-cronjob", &batchv1.CronJob{}, "batch/v1/CronJob", func() client.Object {
-		return &batchv1.CronJob{}
-	}, r.patchCronJobObject); err != nil {
-		return err
-	}
+	workloadReconciler := &workloadReconciler{Client: r.Client, policies: r.policies}
+	workloadController := ctrl.NewControllerManagedBy(mgr).
+		Named("schedulingpolicy-workload").
+		For(&appsv1.Deployment{}, builder.WithPredicates(predicate.NewPredicateFuncs(func(client.Object) bool { return false })))
+	workloadController = watchWorkload(workloadController, &corev1.ReplicationController{}, targetReplicationController)
+	workloadController = watchWorkload(workloadController, &appsv1.Deployment{}, targetDeployment)
+	workloadController = watchWorkload(workloadController, &appsv1.StatefulSet{}, targetStatefulSet)
+	workloadController = watchWorkload(workloadController, &appsv1.DaemonSet{}, targetDaemonSet)
+	workloadController = watchWorkload(workloadController, &batchv1.CronJob{}, targetCronJob)
+	workloadController = watchWorkload(workloadController, &kservev1beta1.InferenceService{}, targetInferenceService)
 
-	inferenceService := &unstructured.Unstructured{}
-	inferenceService.SetAPIVersion("serving.kserve.io/v1beta1")
-	inferenceService.SetKind("InferenceService")
-	if err := r.setupWorkloadController(mgr, "schedulingpolicy-inferenceservice", inferenceService, "serving.kserve.io/v1beta1/InferenceService", func() client.Object {
-		obj := &unstructured.Unstructured{}
-		obj.SetAPIVersion("serving.kserve.io/v1beta1")
-		obj.SetKind("InferenceService")
-		return obj
-	}, r.patchInferenceServiceObject); err != nil {
+	if err := workloadController.Complete(workloadReconciler); err != nil {
 		return err
 	}
 
 	return nil
-}
-
-func (r *SchedulingPolicyReconciler) setupWorkloadController(
-	mgr ctrl.Manager,
-	name string,
-	forObj client.Object,
-	target string,
-	newObj func() client.Object,
-	patch func(context.Context, client.Object, *schedulerv1alpha1.SchedulingPolicy) (bool, error),
-) error {
-	return ctrl.NewControllerManagedBy(mgr).
-		For(forObj).
-		Named(name).
-		Complete(&workloadReconciler{
-			Client: r.Client,
-			target: target,
-			newObj: newObj,
-			patch:  patch,
-		})
 }
