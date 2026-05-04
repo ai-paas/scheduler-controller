@@ -8,11 +8,6 @@ metadata:
 spec:
   priority: 100
   sources:
-    - apiVersion: v1
-      kind: Pod
-      selector:
-        matchLabels:
-          workflow-id: example-workflow
     - apiVersion: apps/v1
       kind: Deployment
       selector:

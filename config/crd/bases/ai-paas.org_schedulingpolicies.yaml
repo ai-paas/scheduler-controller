@@ -52,6 +52,10 @@ spec:
                       minLength: 1
                       type: string
                     kind:
+                      description: |-
+                        Supported workload kinds are controller-managed resources such as Deployment,
+                        ReplicaSet, StatefulSet, DaemonSet, ReplicationController, Job, CronJob,
+                        and serving.kserve.io/v1beta1 InferenceService. Pod is intentionally unsupported.
                       minLength: 1
                       type: string
                     namespaces:

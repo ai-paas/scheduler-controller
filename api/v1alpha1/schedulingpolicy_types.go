@@ -24,6 +24,9 @@ type WorkloadSource struct {
 	// +kubebuilder:validation:MinLength=1
 	APIVersion string `json:"apiVersion"`
 	// +kubebuilder:validation:MinLength=1
+	// Supported workload kinds are controller-managed resources such as Deployment,
+	// ReplicaSet, StatefulSet, DaemonSet, ReplicationController, Job, CronJob,
+	// and serving.kserve.io/v1beta1 InferenceService. Pod is intentionally unsupported.
 	Kind string `json:"kind"`
 	// +optional
 	Namespaces []string `json:"namespaces,omitempty"`

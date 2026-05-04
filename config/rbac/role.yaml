@@ -7,7 +7,6 @@ rules:
 - apiGroups:
   - ""
   resources:
-  - pods
   - replicationcontrollers
   verbs:
   - get
@@ -44,7 +43,6 @@ rules:
   resources:
   - daemonsets
   - deployments
-  - replicasets
   - statefulsets
   verbs:
   - get
@@ -56,7 +54,6 @@ rules:
   - batch
   resources:
   - cronjobs
-  - jobs
   verbs:
   - get
   - list
