@@ -13,7 +13,7 @@ The controller is intended for environments where workload scheduling settings s
 - Which policy should win when multiple policies match the same workload.
 - Which scheduling values should be applied to those workloads.
 
-For native Kubernetes workloads, the controller updates the workload itself or its pod template. For KServe `InferenceService`, it updates supported serving components directly in the custom resource spec.
+For native Kubernetes workloads, the controller updates the workload itself or its pod template. For KServe `InferenceService`, it updates supported component pod specs and labels directly in the custom resource spec.
 
 The custom resource API group is `ai-paas.org`.
 
@@ -27,15 +27,14 @@ kind: SchedulingPolicy
 
 | API version | Kind | Applied to |
 | --- | --- | --- |
-| `v1` | `Pod` | Pod spec and pod labels |
 | `v1` | `ReplicationController` | Pod template spec and template labels |
 | `apps/v1` | `Deployment` | Pod template spec and template labels |
-| `apps/v1` | `ReplicaSet` | Pod template spec and template labels |
 | `apps/v1` | `StatefulSet` | Pod template spec and template labels |
 | `apps/v1` | `DaemonSet` | Pod template spec and template labels |
-| `batch/v1` | `Job` | Pod template spec and template labels |
 | `batch/v1` | `CronJob` | Job template pod spec and template labels |
-| `serving.kserve.io/v1beta1` | `InferenceService` | `predictor`, `transformer`, and `explainer` component scheduling fields and labels |
+| `serving.kserve.io/v1beta1` | `InferenceService` | `predictor`, `transformer`, and `explainer` component pod specs and labels |
+
+For `InferenceService` in KServe serverless mode, Knative Serving must allow `kubernetes.podspec-schedulername` and `kubernetes.podspec-priorityclassname` in the `knative-serving/config-features` ConfigMap.
 
 
 ## Example
@@ -56,7 +55,7 @@ spec:
         matchLabels:
           workflow-id: example-workflow
     - apiVersion: batch/v1
-      kind: Job
+      kind: CronJob
       namespaces:
         - kubeflow
       selector:
@@ -81,7 +80,7 @@ The commands below use only a locally built image from a cloned repository.
 
 Prerequisites:
 
-- Go 1.23 or later
+- Go 1.24.1 or later
 - Docker or a compatible container runtime
 - kubectl
 - A Kubernetes cluster reachable from the current kubeconfig

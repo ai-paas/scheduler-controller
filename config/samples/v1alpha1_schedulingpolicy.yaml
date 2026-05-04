@@ -13,13 +13,8 @@ spec:
       selector:
         matchLabels:
           workflow-id: example-workflow
-    - apiVersion: apps/v1
-      kind: ReplicaSet
-      selector:
-        matchLabels:
-          workflow-id: example-workflow
     - apiVersion: batch/v1
-      kind: Job
+      kind: CronJob
       selector:
         matchLabels:
           workflow-id: example-workflow
