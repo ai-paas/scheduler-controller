@@ -141,7 +141,7 @@ func (r *SchedulingPolicyReconciler) Reconcile(ctx context.Context, req ctrl.Req
 	return ctrl.Result{}, nil
 }
 
-func (r *workloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *workloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) { //nolint:gocyclo
 	targetText, workloadName, ok := strings.Cut(req.Name, workloadRequestSeparator)
 	if !ok {
 		log.FromContext(ctx).Error(fmt.Errorf("malformed workload request %q", req.Name), "unable to resolve workload target")
@@ -232,9 +232,9 @@ func (r *workloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 		return ctrl.Result{}, nil
 	}
 
+	original := obj.DeepCopyObject().(client.Object)
 	var changed bool
 	var err error
-	persist := true
 	fieldsList := make([]podSchedulingFields, 0, 3)
 	switch typed := obj.(type) {
 	case *corev1.ReplicationController:
@@ -271,7 +271,6 @@ func (r *workloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 			labels:            &typed.Spec.JobTemplate.Spec.Template.Labels,
 		})
 	case *kservev1beta1.InferenceService:
-		persist = false
 		fieldsList = append(fieldsList, podSchedulingFields{
 			schedulerName:     &typed.Spec.Predictor.PodSpec.SchedulerName,
 			priorityClassName: &typed.Spec.Predictor.PodSpec.PriorityClassName,
@@ -296,14 +295,11 @@ func (r *workloadReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	}
 	for _, fields := range fieldsList {
 		var fieldChanged bool
-		fieldChanged, err = applyPolicyToPodScheduling(ctx, obj, fields, winner, r.Client, persist)
-		if err != nil {
-			break
-		}
+		fieldChanged = applyPolicyToPodScheduling(obj, fields, winner)
 		changed = fieldChanged || changed
 	}
-	if err == nil && !persist && changed {
-		err = r.Client.Update(ctx, obj)
+	if changed {
+		err = r.Patch(ctx, obj, client.MergeFrom(original))
 	}
 	if err != nil {
 		logger.Error(err, "unable to patch workload scheduling", "policy", winner.Name)
@@ -341,20 +337,17 @@ type podSchedulingFields struct {
 }
 
 func applyPolicyToPodScheduling(
-	ctx context.Context,
 	obj client.Object,
 	fields podSchedulingFields,
 	policy *schedulerv1alpha1.SchedulingPolicy,
-	patcher client.Client,
-	persist bool,
-) (bool, error) {
+) bool {
 	changed := false
 	target := policy.Spec.Target
-	if target.SchedulerName != "" && *fields.schedulerName != target.SchedulerName {
+	if fields.schedulerName != nil && target.SchedulerName != "" && *fields.schedulerName != target.SchedulerName {
 		*fields.schedulerName = target.SchedulerName
 		changed = true
 	}
-	if target.PriorityClassName != "" && *fields.priorityClassName != target.PriorityClassName {
+	if fields.priorityClassName != nil && target.PriorityClassName != "" && *fields.priorityClassName != target.PriorityClassName {
 		*fields.priorityClassName = target.PriorityClassName
 		changed = true
 	}
@@ -384,13 +377,9 @@ func applyPolicyToPodScheduling(
 	}
 	changed = objectMetaChanged || changed
 	if !changed {
-		return false, nil
+		return false
 	}
-	if !persist {
-		return true, nil
-	}
-
-	return true, patcher.Update(ctx, obj)
+	return true
 }
 func applyManagingPolicyAnnotation(annotations map[string]string, policyName string) (bool, map[string]string) {
 	if annotations == nil {

@@ -20,6 +20,7 @@ import (
 	"context"
 	"time"
 
+	kservev1beta1 "github.com/kserve/kserve/pkg/apis/serving/v1beta1"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	appsv1 "k8s.io/api/apps/v1"
@@ -480,5 +481,78 @@ var _ = Describe("SchedulingPolicy Controller", func() {
 			Expect(currentDeployment.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, "z-older-policy"))
 		})
 
+		It("should apply InferenceService scheduling through component pod specs", func() {
+			inferenceService := &kservev1beta1.InferenceService{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "isvc-target",
+					Namespace: "default",
+					Labels:    map[string]string{"workflow-id": "example-workflow"},
+				},
+				Spec: kservev1beta1.InferenceServiceSpec{
+					Predictor: kservev1beta1.PredictorSpec{
+						Model: &kservev1beta1.ModelSpec{
+							ModelFormat: kservev1beta1.ModelFormat{Name: "sklearn"},
+							PredictorExtensionSpec: kservev1beta1.PredictorExtensionSpec{
+								StorageURI: strPtr("gs://kfserving-examples/models/sklearn/1.0/model"),
+							},
+						},
+					},
+					Transformer: &kservev1beta1.TransformerSpec{},
+					Explainer:   &kservev1beta1.ExplainerSpec{},
+				},
+			}
+
+			policy := &schedulerv1alpha1.SchedulingPolicy{
+				ObjectMeta: metav1.ObjectMeta{Name: "isvc-policy"},
+				Spec: schedulerv1alpha1.SchedulingPolicySpec{
+					Sources: []schedulerv1alpha1.WorkloadSource{{
+						APIVersion: "serving.kserve.io/v1beta1",
+						Kind:       "InferenceService",
+						Selector:   &metav1.LabelSelector{MatchLabels: map[string]string{"workflow-id": "example-workflow"}},
+					}},
+					Target: schedulerv1alpha1.SchedulingTarget{
+						SchedulerName:     "isvc-scheduler",
+						PriorityClassName: "isvc-priority",
+						Labels:            map[string]string{"queue": "isvc", "team": "ml-platform"},
+					},
+				},
+			}
+
+			var changed bool
+			fieldsList := []podSchedulingFields{{
+				schedulerName:     &inferenceService.Spec.Predictor.PodSpec.SchedulerName,
+				priorityClassName: &inferenceService.Spec.Predictor.PodSpec.PriorityClassName,
+				labels:            &inferenceService.Spec.Predictor.ComponentExtensionSpec.Labels,
+			}, {
+				schedulerName:     &inferenceService.Spec.Transformer.PodSpec.SchedulerName,
+				priorityClassName: &inferenceService.Spec.Transformer.PodSpec.PriorityClassName,
+				labels:            &inferenceService.Spec.Transformer.ComponentExtensionSpec.Labels,
+			}, {
+				schedulerName:     &inferenceService.Spec.Explainer.PodSpec.SchedulerName,
+				priorityClassName: &inferenceService.Spec.Explainer.PodSpec.PriorityClassName,
+				labels:            &inferenceService.Spec.Explainer.ComponentExtensionSpec.Labels,
+			}}
+			for _, fields := range fieldsList {
+				fieldChanged := applyPolicyToPodScheduling(inferenceService, fields, policy)
+				changed = fieldChanged || changed
+			}
+			Expect(changed).To(BeTrue())
+
+			Expect(inferenceService.Spec.Predictor.PodSpec.SchedulerName).To(Equal("isvc-scheduler"))
+			Expect(inferenceService.Spec.Predictor.PodSpec.PriorityClassName).To(Equal("isvc-priority"))
+			Expect(inferenceService.Spec.Predictor.ComponentExtensionSpec.Labels).To(HaveKeyWithValue("queue", "isvc"))
+			Expect(inferenceService.Spec.Transformer.PodSpec.SchedulerName).To(Equal("isvc-scheduler"))
+			Expect(inferenceService.Spec.Transformer.PodSpec.PriorityClassName).To(Equal("isvc-priority"))
+			Expect(inferenceService.Spec.Transformer.ComponentExtensionSpec.Labels).To(HaveKeyWithValue("team", "ml-platform"))
+			Expect(inferenceService.Spec.Explainer.PodSpec.SchedulerName).To(Equal("isvc-scheduler"))
+			Expect(inferenceService.Spec.Explainer.PodSpec.PriorityClassName).To(Equal("isvc-priority"))
+			Expect(inferenceService.Spec.Explainer.ComponentExtensionSpec.Labels).To(HaveKeyWithValue("queue", "isvc"))
+			Expect(inferenceService.Annotations).To(HaveKeyWithValue(managedByPolicyAnnotation, "isvc-policy"))
+		})
+
 	})
 })
+
+func strPtr(value string) *string {
+	return &value
+}
